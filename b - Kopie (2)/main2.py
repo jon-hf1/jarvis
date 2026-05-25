@@ -373,47 +373,66 @@ def spreche(text):
     text = str(text).strip()
     if not text: return
 
-    # Emojis, Sonderzeichen und Markdown für TTS bereinigen
-    text = re.sub(r"[^\w\s\.,;:!?\-äöüÄÖÜß\(\)]", " ", text)
-    # Mehrfache Leerzeichen/Newlines normalisieren
-    text = re.sub(r"\s+", " ", text).strip()
-    # URLs entfernen
-    text = re.sub(r"https?://\S+", "Link", text)
-    # Markdown-Reste entfernen
-    text = re.sub(r"[#*_`~|]", "", text)
+    # TTS-tauglichen Text bauen: Sonderzeichen raus, Inhalt bleibt
+    clean = text
+    clean = re.sub(r"https?://\S+", "Link", clean)          # URLs → "Link"
+    clean = re.sub(r"[─━═]+", ". ", clean)                   # Trennlinien → Pause
+    clean = re.sub(r"[•·▪▸►◈⚡📖🔗🌐📋📌🔍⚙️🗑✓✂️↩⬇🔁👋😴💤🔒📶📵📡🌙☀️💡🔊🔉🔇▶️⏸⏭⏮⏹🗂🪟🖥️⬅➡➕❌🔄💾🖨🔍🔎☑️✂↶↷⌨⎋↹🗑🖱📋⏱🔔🌙🌤❌⚡🔋🔌]", " ", clean)  # Emojis raus
+    clean = re.sub(r"[^\w\s\.,;:!?\-äöüÄÖÜß\(\)\n]", " ", clean)
+    clean = re.sub(r"[ \t]+", " ", clean)
+    clean = re.sub(r"\n+", ". ", clean)                       # Zeilenumbrüche → Pause
+    clean = re.sub(r"\s+", " ", clean).strip()
+    clean = re.sub(r"\.{2,}", ".", clean)
 
-    if not text: return
+    if not clean: return
 
-    # Dynamischer Timeout: ~60 Wörter pro Minute bei Rate -2
-    word_count  = len(text.split())
-    est_seconds = max(15, int(word_count / 2.5) + 5)
+    # TTS-Rate sicher berechnen: -5 bis +5 ist der PS-Bereich
+    raw_rate = config.get("tts_rate", 150)
+    try:
+        ps_rate = max(-5, min(5, int(raw_rate) // 50 - 2))
+    except Exception:
+        ps_rate = 0
+
+    word_count  = len(clean.split())
+    # Wörter/Min bei Rate 0 ≈ 150, bei -2 ≈ 120
+    wpm         = max(80, 150 - abs(ps_rate) * 15)
+    est_seconds = max(20, int(word_count / wpm * 60) + 10)
 
     def _talk():
+        tmp = None
         try:
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False,
-                                             encoding='utf-8') as f:
-                f.write(text)
-                temp_file = f.name
+            # Text in Temp-Datei schreiben (kein PS-String-Limit)
+            with tempfile.NamedTemporaryFile(
+                    mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+                f.write(clean)
+                tmp = f.name
 
-            safe_path = temp_file.replace("'", "''")
-
-            ps_script = f"""
+            safe = tmp.replace("'", "''")
+            ps   = f"""
 $ErrorActionPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Speech
-$text = Get-Content -LiteralPath '{safe_path}' -Raw -Encoding UTF8
-$speak = New-Object System.Speech.Synthesis.SpeechSynthesizer
-$speak.Rate   = {config.get('tts_rate', 150) // 50 - 4}
-$speak.Volume = 100
-$speak.SelectVoiceByHints('Female', 'German')
-$speak.Speak($text)
-Remove-Item -LiteralPath '{safe_path}' -Force -ErrorAction SilentlyContinue
+$content = [System.IO.File]::ReadAllText('{safe}', [System.Text.Encoding]::UTF8)
+$tts = New-Object System.Speech.Synthesis.SpeechSynthesizer
+$tts.Rate   = {ps_rate}
+$tts.Volume = 100
+try {{ $tts.SelectVoiceByHints('Female', 'German') }} catch {{}}
+$tts.Speak($content)
+$tts.Dispose()
 """
-            subprocess.run(["powershell", "-NoProfile", "-Command", ps_script],
-                           capture_output=True, timeout=est_seconds)
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                capture_output=True, timeout=est_seconds)
+        except subprocess.TimeoutExpired:
+            pass
         except Exception:
             pass
+        finally:
+            if tmp:
+                try: Path(tmp).unlink(missing_ok=True)
+                except Exception: pass
 
     threading.Thread(target=_talk, daemon=True).start()
+
 
 
 
@@ -443,7 +462,6 @@ def lausche(timeout=6, limit=12, language=None):
 # ══════════════════════════════════════════
 #  WEB-SUCHE  – maximale Qualität ohne API-Key
 # ══════════════════════════════════════════
-import math as _math
 
 _search_cache: dict = {}
 
@@ -717,7 +735,7 @@ def _tfidf_scores(query: str, docs: list) -> list:
     idf = {}
     for term in set(q_terms):
         df = sum(1 for s, _, _, _ in all_sents if term in s.lower())
-        idf[term] = _math.log((N + 1) / (df + 1)) + 1 if df else 2.5
+        idf[term] = math.log((N + 1) / (df + 1)) + 1 if df else 2.5
 
     results = []
     for i, (sent, url, doc_idx, sent_idx) in enumerate(all_sents):
@@ -726,7 +744,7 @@ def _tfidf_scores(query: str, docs: list) -> list:
         tf = {t: tokens.count(t) / len(tokens) for t in set(q_terms)}
         base_score = sum(tf.get(t, 0) * idf.get(t, 0) for t in q_terms)
         # Bonus: früh im Dokument = informativer
-        pos_bonus = 1.0 / (_math.log(sent_idx + 2) * 0.5 + 1)
+        pos_bonus = 1.0 / (math.log(sent_idx + 2) * 0.5 + 1)
         # Bonus: alle Query-Terme enthalten
         coverage = sum(1 for t in q_terms if t in sent.lower()) / len(q_terms)
         # Bonus: Query-Phrase direkt enthalten
@@ -1057,26 +1075,6 @@ def web_suche(frage: str, lang: str = "de-de") -> dict:
 #  ANTWORT-AUFBEREITUNG  (komplett neu)
 # ────────────────────────────────────────
 
-def _format_intent_header(intent: str, query: str) -> str:
-    """Kontextgerechte Überschrift je nach Intent."""
-    icons = {
-        "kaufen":      "🛒 Kaufinformationen",
-        "news":        "📰 Aktuelle Infos",
-        "how_to":      "📋 Anleitung",
-        "person":      "👤 Person",
-        "ort":         "📍 Ort",
-        "rezept":      "🍳 Rezept",
-        "wetter":      "🌤 Wetter",
-        "definition":  "📖 Erklärung",
-        "vergleich":   "⚖️ Vergleich",
-        "sport":       "⚽ Sport",
-        "film_serie":  "🎬 Film/Serie",
-        "general":     "🌐 Suchergebnis",
-    }
-    label = icons.get(intent, "🌐 Suchergebnis")
-    return f"{label}: {query}"
-
-
 def humanize_search_response(query: str, result: dict) -> str:
     """
     Baut eine strukturierte, vollständige Antwort.
@@ -1196,64 +1194,194 @@ def extractive_answer(query: str, texts: list, n_sentences: int = 6) -> str:
         elif isinstance(t, str) and t: normalized.append((t, ""))
     scored = _tfidf_scores(query, normalized)
     return _build_coherent_answer(query, scored, n=n_sentences)
+
+# ══════════════════════════════════════════════════════════════
+#  INTELLIGENZ-ENGINE  (Claude API + Gedächtnis + Web-Kontext)
+# ══════════════════════════════════════════════════════════════
+
+# Konversations-Gedächtnis (bleibt während der Session)
+_conversation_memory: list = []   # [{"role":"user/assistant","content":"..."}]
+_MAX_MEMORY = 20                   # letzte N Nachrichten merken
+
+
+def _memory_add(role: str, content: str):
+    _conversation_memory.append({"role": role, "content": content})
+    # Über Limit → älteste (aber nie die erste System-Msg) kürzen
+    while len(_conversation_memory) > _MAX_MEMORY:
+        _conversation_memory.pop(0)
+
+
+def _memory_clear():
+    _conversation_memory.clear()
+
+
+def _build_system_prompt() -> str:
+    """Baut den System-Prompt mit aktuellem PC-Kontext."""
+    now = datetime.datetime.now().strftime("%A, %d. %B %Y, %H:%M Uhr")
+    name = get_user_name()
+    try:
+        i = sysinfo()
+        pc_info = (f"CPU: {i['cpu']}%, RAM: {i['ram']}% "
+                   f"({i['ram_used']}/{i['ram_total']} MB), "
+                   f"Disk: {i['disk']}%")
+        if i['akku']:
+            pc_info += f", Akku: {i['akku'][0]}% {'(lädt)' if i['akku'][1] else ''}"
+    except Exception:
+        pc_info = "nicht verfügbar"
+
+    return f"""Du bist J.A.R.V.I.S, ein smarter, persönlicher Windows-Assistent für {name}.
+
+AKTUELLER KONTEXT:
+- Zeit: {now}
+- PC-Status: {pc_info}
+- Nutzer: {name}
+
+DEIN CHARAKTER:
+- Intelligent, präzise, freundlich und direkt
+- Du redest den Nutzer mit seinem Namen an wenn es passt
+- Du antwortest auf Deutsch, kurz und klar
+- Bei Fragen beantwortest du direkt und vollständig
+- Du erinnerst dich an den bisherigen Gesprächsverlauf dieser Session
+- Bei Rechenaufgaben, Logik, Code gibst du präzise Antworten
+- Bei Wissensfragen kombinierst du dein Wissen mit den bereitgestellten Web-Infos
+- Du schwärmst nicht übermäßig und bist nicht übertrieben höflich
+
+WICHTIG:
+- Wenn Web-Suchergebnisse beigefügt sind, nutze sie als primäre Informationsquelle
+- Antworte immer auf Deutsch außer der Nutzer schreibt auf Englisch
+- Halte Antworten prägnant – max 3-4 Sätze für einfache Fragen, mehr nur wenn nötig"""
+
+
+def ask_claude(user_text: str, web_context: str = "") -> str:
     """
-    Berechnet TF-IDF Scores für alle Sätze aus allen Dokumenten.
-    Gibt Liste von (score, satz, quelle_url) zurück.
+    Sendet Anfrage an Claude API mit Gedächtnis und optionalem Web-Kontext.
+    Gibt Antwort-String zurück oder "" bei Fehler.
     """
-    q_terms = _tokenize(query)
-    if not q_terms:
-        return []
+    api_key = config.get("anthropic_api_key", "").strip()
+    if not api_key or not REQ_OK:
+        return ""
 
-    # Alle Sätze sammeln
-    all_sents = []
-    for doc_text, doc_url in docs:
-        if not doc_text: continue
-        sents = re.split(r"(?<=[.!?])\s+(?=[A-ZÄÖÜ\"\'\(])", doc_text)
-        for s in sents:
-            s = s.strip()
-            if 40 <= len(s) <= 500:
-                # Navigations-/Cookie-/Menü-Zeilen rausfiltern
-                if s.count("|") > 2 or s.count("·") > 2: continue
-                if re.search(r"(Cookie|Datenschutz|Impressum|Newsletter|©|\bAGB\b)", s): continue
-                all_sents.append((s, doc_url))
+    # Nachricht aufbauen – Web-Kontext direkt in die User-Message
+    if web_context:
+        message_content = (f"{user_text}\n\n"
+                           f"[Web-Recherche dazu]:\n{web_context[:3000]}")
+    else:
+        message_content = user_text
 
-    if not all_sents:
-        return []
+    # Gedächtnis + neue Nachricht
+    messages = list(_conversation_memory) + [
+        {"role": "user", "content": message_content}
+    ]
 
-    N = len(all_sents)
-    # IDF: wie viele Sätze enthalten den Term?
-    idf = {}
-    for term in set(q_terms):
-        df = sum(1 for s, _ in all_sents if term in s.lower())
-        idf[term] = _math.log((N + 1) / (df + 1)) + 1 if df else 2.0
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json={
+                "model":      "claude-haiku-4-5-20251001",
+                "max_tokens": 1024,
+                "system":     _build_system_prompt(),
+                "messages":   messages,
+            },
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            answer = data["content"][0]["text"].strip()
+            # Ins Gedächtnis aufnehmen
+            _memory_add("user",      user_text)
+            _memory_add("assistant", answer)
+            return answer
+        elif resp.status_code == 401:
+            return "⚠️ Ungültiger API-Key. Bitte in den Einstellungen prüfen."
+        elif resp.status_code == 429:
+            return "⚠️ API-Limit erreicht. Bitte kurz warten."
+        else:
+            return ""
+    except requests.Timeout:
+        return ""
+    except Exception:
+        return ""
 
-    results = []
-    for i, (sent, url) in enumerate(all_sents):
-        tokens = _tokenize(sent)
-        if not tokens: continue
-        # TF × IDF für query-Terme
-        tf = {t: tokens.count(t) / len(tokens) for t in set(q_terms)}
-        score = sum(tf.get(t, 0) * idf.get(t, 0) for t in q_terms)
-        # Bonus: Satz steht früh im Dokument (informativer)
-        pos_bonus = 1.0 / (_math.log(i + 2))
-        # Bonus: Satz enthält alle Query-Terme
-        coverage = sum(1 for t in q_terms if t in sent.lower()) / len(q_terms)
-        final_score = score * (1 + pos_bonus * 0.3) * (1 + coverage * 0.5)
-        if final_score > 0:
-            results.append((final_score, sent, url))
 
-    results.sort(key=lambda x: -x[0])
-    return results
+
+
+LOKAL = {
+    "hallo":         "Hallo! Was kann ich für dich tun?",
+    "hi":            "Hi! Wie kann ich helfen?",
+    "hey":           "Hey! Was brauchst du?",
+    "wer bist du":   "Ich bin J.A.R.V.I.S – dein smarter Windows-Assistent.",
+    "danke":         "Gern geschehen! 😊",
+    "danke schön":   "Sehr gerne!",
+    "wie geht es":   "Mir geht's bestens! Dir?",
+    "hilfe":         'Sage "alle Befehle" für eine vollständige Liste.',
+}
 
 
 def ki_antwort(text: str):
+    """
+    Haupt-KI-Logik:
+    1. Konversation (Grüßen, Small Talk)
+    2. Lokale Sofort-Antworten
+    3. Claude API (mit Web-Kontext falls nötig)
+    4. Fallback: lokale Web-Suche
+    """
     t = text.lower().strip()
+
+    # Gedächtnis löschen auf Befehl
+    if any(w in t for w in ["vergiss alles","neues gespräch","konversation zurücksetzen","memory clear"]):
+        _memory_clear()
+        return "🧹 Gedächtnis geleert. Wir fangen frisch an!", None
+
+    # Konversations-Antworten (Grüßen etc.)
     conv = conversation_response(text)
     if conv: return conv
+
+    # Lokale Sofort-Antworten
     for key, antwort in LOKAL.items():
         if key in t: return antwort, None
-    result = web_suche(text, config.get("search_lang","de-de"))
-    return humanize_search_response(text, result), result
+
+    # ── Claude API verfügbar? ─────────────────────────────────
+    api_key = config.get("anthropic_api_key", "").strip()
+
+    if api_key and REQ_OK:
+        # Entscheide ob Web-Suche nötig ist
+        intent   = detect_intent(text)
+        need_web = intent in ("news","kaufen","sport","film_serie") or \
+                   any(w in t for w in ["aktuell","heute","neueste","preis","kosten",
+                                        "wer hat gewonnen","ergebnis","wetter"])
+
+        web_ctx = ""
+        search_result = None
+
+        if need_web:
+            # Web-Suche parallel für Kontext
+            search_result = web_suche(text, config.get("search_lang","de-de"))
+            # Kompakten Kontext aus Suchergebnissen bauen
+            ctx_parts = []
+            if search_result.get("wiki"):
+                ctx_parts.append(search_result["wiki"]["extract"][:800])
+            for r in search_result.get("results", [])[:4]:
+                if r.get("body"): ctx_parts.append(f"{r['title']}: {r['body'][:300]}")
+            web_ctx = "\n\n".join(ctx_parts)
+
+        answer = ask_claude(text, web_ctx)
+
+        if answer and not answer.startswith("⚠️"):
+            return answer, search_result
+
+        # Bei API-Fehler: Fehlermeldung nur bei echtem Auth-Fehler zeigen
+        if answer.startswith("⚠️"):
+            return answer, None
+
+    # ── Fallback: Lokale Web-Suche ────────────────────────────
+    search_result = web_suche(text, config.get("search_lang","de-de"))
+    return humanize_search_response(text, search_result), search_result
+
 
 
 # ══════════════════════════════════════════
@@ -2401,21 +2529,6 @@ class ChatManager:
                 self._chat.insert("end", f"\n{code}\n\n", "code")
             else:
                 self._chat.insert("end", f"  {p}\n", tag)
-
-    def _search_result_to_chat_text(self, r):
-        lines = []
-        if r.get("answer"):
-            lines += ["✦ Direkte Antwort:", r["answer"].strip()]
-            if r.get("source"): lines.append(f"Quelle: {r['source']}")
-            if r.get("src_url"): lines.append(r["src_url"])
-        results = r.get("results", [])
-        if results:
-            lines.append("\n✦ Top Ergebnisse:")
-            for i, res in enumerate(results[:3], 1):
-                lines.append(f"{i}. {res.get('title','(kein Titel)')}")
-                if res.get("body"): lines.append(f"   {res['body']}")
-                if res.get("url"):  lines.append(f"   {res['url']}")
-        return "\n".join(lines) if lines else "Keine Suchergebnisse gefunden."
 
     def show_results(self, r):
         pass  # Suchergebnisse-Leiste entfernt
@@ -3571,9 +3684,6 @@ class Jarvis:
         wf = row(c, "Dein Name", "Wie JARVIS dich anspricht")
         entry(wf, self._user_name_var)
 
-        # ═══════════════════════════
-        #  2. SPRACHE & SUCHE
-        # ═══════════════════════════
         c = section("Sprache & Suche", "🎙️")
 
         # Wakeword
@@ -3728,7 +3838,7 @@ class Jarvis:
                 t = COLOR_THEMES[name]
                 for key, cvar in self._color_vars.items():
                     if key in t: cvar.set(t[key])
-                self._save_colors()
+                self._save_colors()   # speichert + wendet live an
         theme_cb.bind("<<ComboboxSelected>>", apply_theme)
 
         # Einzelne Farben bearbeiten
@@ -3781,6 +3891,139 @@ class Jarvis:
 
         # Spacer am Ende
         tk.Frame(f, bg=BG0, height=30).pack()
+    def _save_colors(self):
+        """Farben speichern UND sofort live auf alle Widgets anwenden."""
+        new_colors = {key: var.get() for key, var in self._color_vars.items()}
+        config.setdefault("colors", {}).update(new_colors)
+        cfg_save(config)
+        self._apply_colors_live(new_colors)
+        self._set_status("✓ Farben angewendet", GREEN)
+
+    def _reset_colors(self):
+        if messagebox.askyesno("Farben zurücksetzen",
+                               "Alle Farben auf Standard zurücksetzen?"):
+            config.pop("colors", None)
+            cfg_save(config)
+            for key, var in self._color_vars.items():
+                var.set(_COLOR_DEFAULTS.get(key, "#ffffff"))
+            self._apply_colors_live(_COLOR_DEFAULTS)
+            self._set_status("✓ Farben zurückgesetzt", GREEN)
+
+    def _apply_colors_live(self, colors: dict):
+        """Wendet neue Farben sofort auf ALLE Widgets an – kein Neustart nötig."""
+        # Globale Farbvariablen aktualisieren
+        import sys
+        mod = sys.modules[__name__]
+        color_map = {
+            "BG0":BG0,"BG1":BG1,"BG2":BG2,"BG3":BG3,"BG4":BG4,
+            "BORDER":BORDER,"DIM":DIM,"DIM2":DIM2,
+            "CYAN":CYAN,"CYAN2":CYAN2,"AMBER":AMBER,"AMBER2":AMBER2,
+            "GREEN":GREEN,"GREEN2":GREEN2,"RED":RED,"PURPLE":PURPLE,
+            "BLUE":BLUE,"TEXT":TEXT,"TEXT2":TEXT2,"WHITE":WHITE,
+        }
+        # Neue Werte in globale Variablen schreiben
+        for key, val in colors.items():
+            if hasattr(mod, key):
+                setattr(mod, key, val)
+
+        new_bg0  = colors.get("BG0",  BG0)
+        new_bg1  = colors.get("BG1",  BG1)
+        new_bg2  = colors.get("BG2",  BG2)
+        new_bg3  = colors.get("BG3",  BG3)
+        new_bg4  = colors.get("BG4",  BG4)
+        new_cyan = colors.get("CYAN", CYAN)
+        new_text = colors.get("TEXT", TEXT)
+        new_text2= colors.get("TEXT2",TEXT2)
+        new_border=colors.get("BORDER",BORDER)
+        new_dim2 = colors.get("DIM2", DIM2)
+        new_green= colors.get("GREEN",GREEN)
+        new_amber= colors.get("AMBER",AMBER)
+        new_red  = colors.get("RED",  RED)
+        new_white= colors.get("WHITE",WHITE)
+
+        # Mapping: alte Farbe → neue Farbe
+        remap = {
+            BG0:new_bg0, BG1:new_bg1, BG2:new_bg2, BG3:new_bg3, BG4:new_bg4,
+            CYAN:new_cyan, TEXT:new_text, TEXT2:new_text2, BORDER:new_border,
+            DIM2:new_dim2, GREEN:new_green, AMBER:new_amber, RED:new_red,
+            WHITE:new_white,
+        }
+
+        def recolor(widget):
+            """Rekursiv alle Widgets neu einfärben."""
+            try:
+                # bg / background
+                try:
+                    cur_bg = widget.cget("bg")
+                    if cur_bg in remap:
+                        widget.config(bg=remap[cur_bg])
+                except Exception: pass
+                # fg / foreground
+                try:
+                    cur_fg = widget.cget("fg")
+                    if cur_fg in remap:
+                        widget.config(fg=remap[cur_fg])
+                except Exception: pass
+                # highlightbackground
+                try:
+                    cur_hb = widget.cget("highlightbackground")
+                    if cur_hb in remap:
+                        widget.config(highlightbackground=remap[cur_hb])
+                except Exception: pass
+                # insertbackground (Cursor)
+                try:
+                    cur_ib = widget.cget("insertbackground")
+                    if cur_ib in remap:
+                        widget.config(insertbackground=remap[cur_ib])
+                except Exception: pass
+            except Exception: pass
+            # Kinder rekursiv
+            try:
+                for child in widget.winfo_children():
+                    recolor(child)
+            except Exception: pass
+
+        self.root.config(bg=new_bg0)
+        recolor(self.root)
+
+        # Chat-Tags neu setzen
+        try:
+            cm = self.chat_manager
+            if cm and cm._chat:
+                cm._chat.config(bg=new_bg1, fg=new_text)
+                cm._chat.tag_configure("u_body", background=new_bg2, foreground=new_text)
+                cm._chat.tag_configure("j_body", background=new_bg2, foreground=new_text)
+                cm._chat.tag_configure("j_name", foreground=new_cyan)
+                cm._chat.tag_configure("u_name", foreground=colors.get("BLUE", BLUE))
+                cm._chat.tag_configure("sys",    foreground=new_dim2)
+                cm._chat.tag_configure("warn",   foreground=new_amber)
+        except Exception: pass
+
+        # Orb neu zeichnen
+        try:
+            if self.chat_manager._orb_canvas:
+                self.chat_manager._orb_draw_idle()
+        except Exception: pass
+
+        # TTK-Style neu setzen
+        try:
+            s = ttk.Style()
+            s.configure("TNotebook",       background=new_bg1)
+            s.configure("TNotebook.Tab",   background=new_bg2, foreground=new_dim2)
+            s.map("TNotebook.Tab",
+                  background=[("selected",new_bg4),("active",new_bg3)],
+                  foreground=[("selected",new_cyan),("active",new_text)])
+            s.configure("Treeview",
+                        background=new_bg3, foreground=new_text,
+                        fieldbackground=new_bg3)
+            s.configure("TScrollbar",      background=new_bg3, troughcolor=new_bg1)
+            s.configure("TProgressbar",    background=new_cyan, troughcolor=new_bg3)
+        except Exception: pass
+
+        self.root.update_idletasks()
+
+
+
     def _save_settings(self):
         updates = {key: var.get() for key, var in self._sv.items()}
         updates["wakeword_enabled"]      = self._wakeword_enabled_var.get()
